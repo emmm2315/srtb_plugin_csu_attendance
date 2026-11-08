@@ -1,0 +1,13 @@
+# 兼容清单：ShiritaiBot 0.2.x 的 WebUI「安装插件」仍只接受带 plugin.toml 的 ZIP，
+# 而运行时在 metadata.yaml 存在时会优先按 API v2 加载（见 docs/PLUGINS.md）。
+# 因此这里保留一个最小的 v1 清单，仅用于通过 ZIP 安装校验；实际配置和入口以
+# metadata.yaml + _conf_schema.json + main.py 为准。
+api = 1
+name = "srtb_plugin_csu_attendance"
+description = "中南大学课表 / 到课查询，可同步到 ShiritaiBot 日程"
+version = "1.0.1"
+
+[settings_schema]
+type = "object"
+properties = {}
+

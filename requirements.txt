@@ -1,0 +1,2 @@
+# 本插件只使用 ShiritaiBot 自带的 httpx 与 cryptography，无需额外依赖。
+# 可选：需要自动识别 CAS 验证码时安装 ddddocr。

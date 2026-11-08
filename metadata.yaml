@@ -1,0 +1,11 @@
+name: srtb_plugin_csu_attendance
+display_name: 中南大学到课与课表
+desc: 查询中南大学学生的课表、到课与打卡情况，可把课表导入 ShiritaiBot 日程并在上课前提醒。
+short_desc: 中南大学课表 / 到课查询，可同步到日程
+version: 1.0.1
+author: astrbot-plugin-csu-attendance
+support_platforms:
+  - qq
+  - web
+shiritaibot_version: ">=0.2,<1"
+

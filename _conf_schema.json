@@ -1,0 +1,100 @@
+{
+  "weds_token": {
+    "description": "WEDS 到课平台 Token",
+    "type": "string",
+    "hint": "推荐由管理员抓包一次后填在这里，全群共用。留空时使用 /class token 缓存的 token。",
+    "default": "",
+    "secret": true,
+    "obvious_hint": true
+  },
+  "cas_username": {
+    "description": "统一身份认证账号（学号）",
+    "type": "string",
+    "hint": "用于自动登录教务系统。留空则无法自动刷新教务会话；不填写也不影响 WEDS 查询。",
+    "default": ""
+  },
+  "cas_password": {
+    "description": "统一身份认证密码",
+    "type": "string",
+    "hint": "加密保存在 ShiritaiBot 的 Vault 中，不会外发。",
+    "default": "",
+    "secret": true
+  },
+  "cas_service": {
+    "description": "统一身份认证的 service 参数",
+    "type": "string",
+    "hint": "默认指向教务系统 sso.jsp，一般不需要修改。",
+    "default": "http://csujwc.its.csu.edu.cn/sso.jsp"
+  },
+  "weds_base": {
+    "description": "WEDS 到课平台地址",
+    "type": "string",
+    "default": "https://wedsk12.weds.com.cn:8081"
+  },
+  "orga_id": {
+    "description": "机构 ID（orgaId）",
+    "type": "string",
+    "default": "10001"
+  },
+  "http_proxy": {
+    "description": "HTTP 代理",
+    "type": "string",
+    "hint": "形如 http://127.0.0.1:7890，留空表示直连。",
+    "default": ""
+  },
+  "request_timeout": {
+    "description": "网络请求超时（秒）",
+    "type": "int",
+    "slider": { "min": 5, "max": 60, "step": 1 },
+    "default": 20
+  },
+  "use_ocr": {
+    "description": "需要验证码时用 ddddocr 自动识别",
+    "type": "bool",
+    "hint": "需额外安装 ddddocr。关闭后遇到验证码会提示改用其他方式登录。",
+    "default": false
+  },
+  "token_check_enable": {
+    "description": "后台自动体检 WEDS Token",
+    "type": "bool",
+    "hint": "定时真实调用一次接口验证 token，失效时私聊主人告警。",
+    "default": true
+  },
+  "token_check_interval_hours": {
+    "description": "Token 体检间隔（小时）",
+    "type": "float",
+    "hint": "默认 6 小时。设为 0 表示只在启动时检查一次。",
+    "slider": { "min": 0, "max": 48, "step": 0.5 },
+    "default": 6
+  },
+  "alert_session": {
+    "description": "失效告警接收会话（可选）",
+    "type": "string",
+    "hint": "留空则私聊主人。也可填某个会话 ID，例如 group:qq:123456。",
+    "default": ""
+  },
+  "timezone": {
+    "description": "课表时区",
+    "type": "string",
+    "default": "Asia/Shanghai"
+  },
+  "schedule_sync": {
+    "description": "自动把主人的课表同步到日程",
+    "type": "bool",
+    "hint": "开启后，插件会定期把主人绑定的本周课表写入 ShiritaiBot 日程。首次请先由主人执行 /class 日程。",
+    "default": false
+  },
+  "schedule_sync_hours": {
+    "description": "自动同步间隔（小时）",
+    "type": "float",
+    "slider": { "min": 1, "max": 24, "step": 0.5 },
+    "default": 6
+  },
+  "class_reminder_minutes": {
+    "description": "上课提醒提前量（分钟）",
+    "type": "int",
+    "hint": "导入日程时同时创建上课提醒。设为 0 表示只导入课程，不建提醒。",
+    "slider": { "min": 0, "max": 120, "step": 5 },
+    "default": 15
+  }
+}
