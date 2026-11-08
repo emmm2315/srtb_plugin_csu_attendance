@@ -235,4 +235,6 @@ python tests/run_tests.py
 - 日程写入依赖宿主当前的 `routine` 存储结构；ShiritaiBot 升级后如改动该结构，需要同步调整。
 - 自动更新只支持公开 GitHub 仓库，且必须通过提升版本号触发；更新后依赖宿主的
   `PluginManager.reload()`，如果宿主改为异步重载机制，需要相应调整。
+- 自动更新通过 GitHub 公开 API 读取 `metadata.yaml` / 下载 zipball；未认证请求有每小时
+  60 次的限额，默认 24 小时检查一次足够，频繁手动检查可能遇到 403。
 

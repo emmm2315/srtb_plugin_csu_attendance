@@ -1463,12 +1463,13 @@ class CsuAttendance(Plugin):
             str(self._cfg("update_repo") or DEFAULT_UPDATE_REPO)
         )
         url = (
-            "https://raw.githubusercontent.com/%s/%s/%s/metadata.yaml?t=%d"
-            % (owner, repo, UPDATE_BRANCH, int(time.time()))
+            "https://api.github.com/repos/%s/%s/contents/metadata.yaml?ref=%s"
+            % (owner, repo, UPDATE_BRANCH)
         )
         headers = {
             "User-Agent": "%s/%s" % (PLUGIN_ID, VERSION),
-            "Cache-Control": "no-cache",
+            "Accept": "application/vnd.github.raw",
+            "X-GitHub-Api-Version": "2022-11-28",
         }
         try:
             async with httpx.AsyncClient(
@@ -1479,6 +1480,15 @@ class CsuAttendance(Plugin):
                 response = await client.get(url, headers=headers)
                 response.raise_for_status()
                 text = response.text
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            if code == 403:
+                raise PublicError(
+                    "检查更新失败：GitHub API 限流或仓库不可访问（403）"
+                ) from None
+            if code == 404:
+                raise PublicError("检查更新失败：更新源仓库或 metadata.yaml 不存在") from None
+            raise PublicError("检查更新失败：HTTP %d" % code) from None
         except httpx.HTTPError as exc:
             raise PublicError("检查更新失败：%s" % type(exc).__name__) from None
 
@@ -1494,14 +1504,15 @@ class CsuAttendance(Plugin):
         }
 
     async def _download_update_archive(self, owner: str, repo: str) -> bytes:
-        url = "https://github.com/%s/%s/archive/refs/heads/%s.zip" % (
+        url = "https://api.github.com/repos/%s/%s/zipball/%s" % (
             owner,
             repo,
             UPDATE_BRANCH,
         )
         headers = {
             "User-Agent": "%s/%s" % (PLUGIN_ID, VERSION),
-            "Cache-Control": "no-cache",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
         }
         try:
             async with httpx.AsyncClient(
@@ -1519,6 +1530,13 @@ class CsuAttendance(Plugin):
                             raise PublicError("更新包超过 20 MiB，已拒绝")
                         chunks.append(chunk)
                     data = b"".join(chunks)
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            if code == 403:
+                raise PublicError(
+                    "下载更新失败：GitHub API 限流或仓库不可访问（403）"
+                ) from None
+            raise PublicError("下载更新失败：HTTP %d" % code) from None
         except httpx.HTTPError as exc:
             raise PublicError("下载更新失败：%s" % type(exc).__name__) from None
 
