@@ -8,6 +8,7 @@
     /class 周                       整周课表
     /class 文字                     强制文字（ShiritaiBot 目前只支持文字）
     /class 日程                     把本周课表导入 ShiritaiBot 日程
+    /class 日程 自动 on|off         每周自动导入开关
     /class 日程 关闭                移除本插件导入的日程
     /bind <学号>                    绑定学号
     /bind @某人 <学号>              帮某人完成首次绑定
@@ -102,7 +103,7 @@ except ImportError:  # 兼容直接以脚本路径加载 / 单文件测试
     )
 
 PLUGIN_ID = "srtb_plugin_csu_attendance"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_UPDATE_REPO = "https://github.com/emmm2315/srtb_plugin_csu_attendance"
 UPDATE_BRANCH = "main"
 UPDATE_MAX_ARCHIVE = 20 * 1024 * 1024
@@ -116,6 +117,7 @@ KV_BINDINGS = "bindings_v2"          # {"平台:用户ID": {"user_serial":..., "
 KV_TOKEN = "weds_token"              # {"value": ..., "updated_at": ...}
 KV_OWNER_KEY = "owner_key"           # 最近一次使用本插件的主人的绑定键
 KV_SCHEDULE_KEYS = "schedule_keys"   # 本插件写入日程的 routine id 列表
+KV_SCHEDULE_WEEK = "schedule_week"   # 已自动/手动导入的 ISO 周，例如 2026-W45
 KV_LEGACY_BINDINGS = "bindings"      # 旧版按会话存的绑定，仅用于清理
 KV_UPDATE_STATE = "update_state"     # {"version":..., "applied_at":..., "backup":...}
 
@@ -160,6 +162,7 @@ class CsuAttendance(Plugin):
         self._alerted_token: str = ""
         # 日程同步
         self._schedule_task: asyncio.Task | None = None
+        self._schedule_wake = asyncio.Event()
         self._schedule_keys: list[str] = []
         self._owner_key: str = ""
         # 自动更新
@@ -255,11 +258,11 @@ class CsuAttendance(Plugin):
         self._cas.password = self._config_password
 
         self.logger.log(
-            "[CSU] 插件已加载：%d 个绑定，WEDS token %s，日程同步 %s，自动更新 %s"
+            "[CSU] 插件已加载：%d 个绑定，WEDS token %s，每周日程 %s，自动更新 %s"
             % (
                 len(self._bindings),
                 "已配置" if self._current_token() else "未配置",
-                "开启" if self._as_bool("schedule_sync") else "关闭",
+                "开启" if self._as_bool("weekly_schedule") else "关闭",
                 "开启" if self._as_bool("auto_update") else "关闭",
             )
         )
@@ -268,7 +271,7 @@ class CsuAttendance(Plugin):
 
         if self._as_bool("token_check_enable", True):
             self._health_task = asyncio.create_task(self._health_loop())
-        if self._as_bool("schedule_sync"):
+        if self._as_bool("weekly_schedule"):
             self._schedule_task = asyncio.create_task(self._schedule_loop())
         if self._as_bool("auto_update"):
             self._update_task = asyncio.create_task(self._update_loop())
@@ -511,6 +514,8 @@ class CsuAttendance(Plugin):
         if key and key != self._owner_key:
             self._owner_key = key
             await self.put_kv_data(KV_OWNER_KEY, key)
+        # 主人刚绑定/刚发命令时，让每周导入循环立刻补一次（如果本周还没导入）。
+        self._schedule_wake.set()
 
     # ── 教务系统登录 ──────────────────────────────────────────────────────
 
@@ -843,6 +848,10 @@ class CsuAttendance(Plugin):
             }
             await self._save_bindings()
             await self._maybe_recheck_token()
+            if event.is_owner:
+                # 主人的学号变了，本周日程需要按新学号重新导入。
+                await self.put_kv_data(KV_SCHEDULE_WEEK, "")
+            self._schedule_wake.set()
             yield event.plain_result(
                 "✅ 绑定成功，学号：%s\n发送 /class 查看今日课表。" % student_id
             )
@@ -866,6 +875,7 @@ class CsuAttendance(Plugin):
         }
         await self._save_bindings()
         await self._maybe_recheck_token()
+        self._schedule_wake.set()
 
         if existing:
             yield event.plain_result(
@@ -915,6 +925,8 @@ class CsuAttendance(Plugin):
                 await saver()
             except Exception:
                 self.logger.warning("[CSU] 插件配置保存失败")
+        await self.put_kv_data(KV_SCHEDULE_WEEK, "")
+        self._schedule_wake.set()
         error = await self._ensure_cas()
         if error:
             yield event.plain_result("⚠️ 凭据已保存，但登录验证未通过：\n%s" % error)
@@ -1078,7 +1090,11 @@ class CsuAttendance(Plugin):
             "机构 ID: %s" % self._orga_id(),
             "已绑定会话数: %d" % len(self._bindings),
             "已导入日程项: %d" % len(self._schedule_keys),
-            "日程自动同步: %s" % ("开启" if self._as_bool("schedule_sync") else "关闭"),
+            "每周日程: %s（%s）"
+            % (
+                "开启" if self._as_bool("weekly_schedule") else "关闭",
+                self._schedule_desc(),
+            ),
             "自动更新: %s（每 %.0f 小时检查）"
             % (
                 "开启" if self._as_bool("auto_update") else "关闭",
@@ -1168,6 +1184,7 @@ class CsuAttendance(Plugin):
                 "/class token check      校验 token 是否有效",
                 "/class setup            抓包获取 token 的教程",
                 "/class 日程             把本周课表导入 ShiritaiBot 日程",
+                "/class 日程 自动 on|off 每周自动导入开关",
                 "/class 日程 关闭        移除本插件导入的日程",
                 "/class update           立即检查并更新插件",
                 "/class update check     只检查是否有新版本",
@@ -1196,7 +1213,8 @@ class CsuAttendance(Plugin):
             serial = self._bindings[self._owner_key].get("user_serial")
             if serial:
                 return str(serial)
-        return ""
+        # 没绑学号但配置了 CAS 账号时，学号就是 userSerial。
+        return (self._cas.username or "").strip()
 
     def _course_datetimes(self, course: dict) -> tuple[datetime, datetime] | None:
         """把一条课程记录转成带时区的起止时间；数据不完整时返回 None。"""
@@ -1349,6 +1367,7 @@ class CsuAttendance(Plugin):
 
         self._schedule_keys = new_keys
         await self.put_kv_data(KV_SCHEDULE_KEYS, new_keys)
+        await self.put_kv_data(KV_SCHEDULE_WEEK, self._week_key())
         self.logger.log(
             "[CSU] 日程同步完成：%d 节课，%d 条提醒，清理 %d 条旧项"
             % (courses_written, reminders_written, len(stale))
@@ -1362,14 +1381,131 @@ class CsuAttendance(Plugin):
             "week_num": info.get("week_num") or "",
         }
 
+    def _week_key(self, at: datetime | None = None) -> str:
+        moment = at or datetime.now(self._tz)
+        iso = moment.isocalendar()
+        return "%04d-W%02d" % (iso.year, iso.week)
+
+    def _schedule_clock(self) -> tuple[int, int]:
+        raw = str(self._cfg("schedule_time") or "06:10").strip()
+        match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", raw)
+        if not match:
+            return 6, 10
+        return int(match.group(1)), int(match.group(2))
+
+    def _next_weekly_run_seconds(self) -> float:
+        weekday = max(0, min(6, self._as_int("schedule_weekday", 0)))
+        hour, minute = self._schedule_clock()
+        now = datetime.now(self._tz)
+        target = (now + timedelta(days=(weekday - now.weekday()) % 7)).replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        if target <= now:
+            target += timedelta(days=7)
+        return max(60.0, (target - now).total_seconds())
+
+    def _schedule_desc(self) -> str:
+        names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        weekday = max(0, min(6, self._as_int("schedule_weekday", 0)))
+        hour, minute = self._schedule_clock()
+        return "每周%s %02d:%02d" % (names[weekday], hour, minute)
+
+    async def _stop_schedule_task(self) -> None:
+        task, self._schedule_task = self._schedule_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _weekly_schedule_once(self) -> str:
+        """本周还没导入过就导入一次。返回 synced / already / no_student / retry。"""
+        if not self._as_bool("weekly_schedule"):
+            return "disabled"
+        student = self._schedule_owner_serial()
+        if not student:
+            return "no_student"
+        week = self._week_key()
+        last = await self.get_kv_data(KV_SCHEDULE_WEEK, "")
+        if str(last or "") == week:
+            return "already"
+        try:
+            result = await self._sync_schedule(student)
+        except PublicError as exc:
+            self.logger.warning("[CSU] 每周日程导入失败：%s" % exc)
+            return "retry"
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("[CSU] 每周日程导入异常：%s" % type(exc).__name__)
+            return "retry"
+        await self.put_kv_data(KV_SCHEDULE_WEEK, week)
+        self.logger.log(
+            "[CSU] 每周日程导入完成（%s）：第 %s 周，%d 节课，%d 条提醒"
+            % (
+                week,
+                result.get("week_now") or "?",
+                result["courses"],
+                result["reminders"],
+            )
+        )
+        return "synced"
+
     async def _cmd_schedule(self, event: MessageEvent, arg: str):
-        if (arg or "").strip().lower() in {"关闭", "off", "清除", "remove", "stop"}:
+        rest = (arg or "").strip()
+        lower = rest.lower()
+
+        # /class 日程 自动 on|off
+        if lower in {"auto", "自动"} or lower.startswith(("auto ", "自动 ")):
+            parts = lower.split()
+            if len(parts) == 1:
+                week_done = (
+                    await self.get_kv_data(KV_SCHEDULE_WEEK, "")
+                ) == self._week_key()
+                yield event.plain_result(
+                    "每周自动导入：%s\n时间：%s\n本周已导入：%s"
+                    % (
+                        "开启" if self._as_bool("weekly_schedule") else "关闭",
+                        self._schedule_desc(),
+                        "是" if week_done else "否",
+                    )
+                )
+                return
+            enable = parts[1] in {"on", "开", "启用", "true", "1"}
+            self.config["weekly_schedule"] = enable
+            saver = getattr(self.config, "save_config", None)
+            if callable(saver):
+                try:
+                    await saver()
+                except Exception:
+                    self.logger.warning("[CSU] 每周自动导入配置保存失败")
+            if enable:
+                if self._schedule_task is None or self._schedule_task.done():
+                    self._schedule_task = asyncio.create_task(self._schedule_loop())
+                self._schedule_wake.set()
+                yield event.plain_result(
+                    "✅ 每周自动导入已开启：%s。\n本周还没导入时会立即补一次。"
+                    % self._schedule_desc()
+                )
+            else:
+                await self._stop_schedule_task()
+                yield event.plain_result("✅ 每周自动导入已关闭。")
+            return
+
+        if lower in {"关闭", "off", "清除", "remove", "stop"}:
             result = await self._sync_schedule("", remove=True)
+            # 标记本周已处理，避免自动循环马上又导回来。
+            await self.put_kv_data(KV_SCHEDULE_WEEK, self._week_key())
+            tail = (
+                "\n自动导入仍开启，下周会重新导入；要停止请发送 /class 日程 自动 off。"
+                if self._as_bool("weekly_schedule")
+                else ""
+            )
             yield event.plain_result(
                 "✅ 已移除本插件导入的日程（%d 项）。\n"
-                "手动创建的其他日程不受影响。" % result["removed"]
+                "手动创建的其他日程不受影响。%s" % (result["removed"], tail)
             )
             return
+
         binding = self._bindings.get(self._event_key(event)) or {}
         student = str(binding.get("user_serial") or "").strip()
         if not student:
@@ -1389,6 +1525,7 @@ class CsuAttendance(Plugin):
         if student and event.is_owner:
             self._owner_key = self._event_key(event)
             await self.put_kv_data(KV_OWNER_KEY, self._owner_key)
+        await self.put_kv_data(KV_SCHEDULE_WEEK, self._week_key())
         yield event.plain_result(
             "✅ 课表已导入 ShiritaiBot 日程\n"
             "─────────────────────────\n"
@@ -1396,6 +1533,7 @@ class CsuAttendance(Plugin):
             "写入课程：%d 节\n"
             "创建上课提醒：%d 条%s\n"
             "清理旧日程：%d 条\n\n"
+            "每周自动导入：%s（%s）\n"
             "现在可以用「日程」页面查看，也可以直接问我「今天有什么课」。\n"
             "提醒会由 ShiritaiBot 的日程系统发出；关闭提醒请把配置里的"
             "「上课提醒提前量」设为 0。"
@@ -1408,26 +1546,41 @@ class CsuAttendance(Plugin):
                 if result["reminders"]
                 else "",
                 result["removed"],
+                "开启" if self._as_bool("weekly_schedule") else "关闭",
+                self._schedule_desc(),
             )
         )
 
     async def _schedule_loop(self) -> None:
-        """主人开启自动同步后，定期刷新课表，跨周自动替换旧课程。"""
-        interval = max(1.0, self._as_float("schedule_sync_hours", 6.0))
-        await asyncio.sleep(20)
+        """每周固定时间导入一次；启动时若本周未导入，会立即补一次。"""
+        try:
+            await asyncio.wait_for(self._schedule_wake.wait(), timeout=20)
+        except TimeoutError:
+            pass
         while True:
+            self._schedule_wake.clear()
+            retry = False
+            outcome = "disabled"
             try:
-                student = self._schedule_owner_serial()
-                if student:
-                    await self._sync_schedule(student)
+                if self._as_bool("weekly_schedule"):
+                    outcome = await self._weekly_schedule_once()
+                    retry = outcome == "retry"
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                self.logger.warning("[CSU] 日程自动同步失败：%s" % exc)
+                self.logger.warning("[CSU] 每周日程导入失败：%s" % exc)
+                retry = True
+
+            if retry or outcome == "no_student":
+                delay = min(6 * 3600.0, self._next_weekly_run_seconds())
+            else:
+                delay = self._next_weekly_run_seconds()
             try:
-                await asyncio.sleep(interval * 3600)
-            except asyncio.CancelledError:
-                raise
+                await asyncio.wait_for(
+                    self._schedule_wake.wait(), timeout=max(30.0, delay)
+                )
+            except TimeoutError:
+                pass
 
     # ── 自动更新 ──────────────────────────────────────────────────────────
 
@@ -1937,4 +2090,5 @@ class CsuAttendance(Plugin):
                 "csu_attendance；要刷新日程里的课程可调用 csu_sync_schedule，"
                 "已导入的课程也能用 routine_list 查看。</csu_attendance>"
             )
+
 

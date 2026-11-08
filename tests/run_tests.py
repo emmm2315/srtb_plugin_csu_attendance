@@ -448,7 +448,7 @@ async def test_plugin():
         weds_base="https://example.invalid",
         orga_id="10001",
         timezone="Asia/Shanghai",
-        schedule_sync=False,
+        weekly_schedule=False,
         class_reminder_minutes=15,
         render_mode="text",
     )
@@ -533,7 +533,7 @@ async def test_schedule():
         weds_base="https://example.invalid",
         orga_id="10001",
         timezone="Asia/Shanghai",
-        schedule_sync=False,
+        weekly_schedule=False,
         class_reminder_minutes=15,
     )
     plugin = CsuAttendance(ctx, settings)
@@ -583,8 +583,60 @@ async def test_schedule():
     await plugin.terminate()
 
 
+async def test_weekly_schedule():
+    print("\n[4] 每周自动导入")
+    from main import CsuAttendance
+
+    ctx = FakeContext()
+    settings = FakeSettings(
+        token_check_enable=False,
+        weds_token="TEST_TOKEN",
+        weds_base="https://example.invalid",
+        orga_id="10001",
+        timezone="Asia/Shanghai",
+        weekly_schedule=False,
+        schedule_weekday=0,
+        schedule_time="06:10",
+        class_reminder_minutes=15,
+    )
+    plugin = CsuAttendance(ctx, settings)
+    await plugin.initialize()
+
+    async def fake_week_rank(token, user_serial, orga_id="10001", filter_week=0):
+        return sample_data()
+
+    plugin._weds.week_rank = fake_week_rank
+    plugin._bindings["qq:999"] = {"user_serial": "2024000001", "bound_at": 0}
+    plugin._owner_key = "qq:999"
+    plugin.config["weekly_schedule"] = True
+
+    check("周编号格式", "W" in plugin._week_key(), plugin._week_key())
+    delay = plugin._next_weekly_run_seconds()
+    check("下一次执行在 7 天内", 60 <= delay <= 7 * 86400, str(delay))
+
+    first = await plugin._weekly_schedule_once()
+    check("本周首次自动导入", first == "synced", first)
+    check(
+        "本周标记已写入",
+        await plugin.get_kv_data("schedule_week", "") == plugin._week_key(),
+    )
+    routine = [row for (kind, _), row in ctx.host.store.rows.items() if kind == "routine"]
+    check("自动导入写入课程", len([r for r in routine if r["kind"] == "course"]) == 3)
+    second = await plugin._weekly_schedule_once()
+    check("同一周不重复导入", second == "already", second)
+
+    owner = FakeEvent(sender_id="999", owner=True)
+    state = await collect(plugin._cmd_schedule(owner, "自动"))
+    check("每周自动导入状态可查询", "开启" in state[0], state[0])
+    off = await collect(plugin._cmd_schedule(owner, "自动 off"))
+    check("每周自动导入可关闭", "已关闭" in off[0], off[0])
+    check("关闭后任务停止", plugin._schedule_task is None)
+
+    await plugin.terminate()
+
+
 async def test_tools():
-    print("\n[4] LLM 工具")
+    print("\n[5] LLM 工具")
     from main import CsuAttendance, VERSION
 
     ctx = FakeContext()
@@ -594,7 +646,7 @@ async def test_tools():
         weds_base="https://example.invalid",
         orga_id="10001",
         timezone="Asia/Shanghai",
-        schedule_sync=False,
+        weekly_schedule=False,
         class_reminder_minutes=15,
     )
     plugin = CsuAttendance(ctx, settings)
@@ -634,7 +686,7 @@ async def test_tools():
 
 
 async def test_update():
-    print("\n[5] 自动更新")
+    print("\n[6] 自动更新")
     from main import CsuAttendance, VERSION
     from shiritaibot.api import PublicError
 
@@ -659,7 +711,7 @@ async def test_update():
         weds_base="https://example.invalid",
         orga_id="10001",
         timezone="Asia/Shanghai",
-        schedule_sync=False,
+        weekly_schedule=False,
         auto_update=False,
         update_repo="https://github.com/emmm2315/srtb_plugin_csu_attendance",
         update_interval_hours=24,
@@ -737,7 +789,7 @@ async def test_update():
 
 
 def test_manifest():
-    print("\n[6] 清单 / 配置")
+    print("\n[7] 清单 / 配置")
     import re
 
     meta_text = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
@@ -757,6 +809,12 @@ def test_manifest():
     check("cas_password 是 secret", schema["cas_password"].get("secret") is True)
     check("自动更新默认关闭", schema["auto_update"].get("default") is False)
     check("更新源是 GitHub", "github.com" in schema["update_repo"].get("default", ""))
+    check("每周日程默认开启", schema["weekly_schedule"].get("default") is True)
+    check(
+        "默认周一 06:10 导入",
+        schema["schedule_weekday"].get("default") == 0
+        and schema["schedule_time"].get("default") == "06:10",
+    )
     allowed = {"string", "text", "int", "float", "bool", "object", "list", "dict", "template_list"}
     check("所有配置类型合法", all(spec.get("type") in allowed for spec in schema.values()))
     check("配置都有 description", all(spec.get("description") for spec in schema.values()))
@@ -773,6 +831,7 @@ async def main():
     await test_renderer()
     await test_plugin()
     await test_schedule()
+    await test_weekly_schedule()
     await test_tools()
     await test_update()
     test_manifest()
@@ -782,5 +841,7 @@ async def main():
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
+
+
 
 

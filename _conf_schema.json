@@ -78,17 +78,25 @@
     "type": "string",
     "default": "Asia/Shanghai"
   },
-  "schedule_sync": {
-    "description": "自动把主人的课表同步到日程",
+  "weekly_schedule": {
+    "description": "每周自动导入课表到日程",
     "type": "bool",
-    "hint": "开启后，插件会定期把主人绑定的本周课表写入 ShiritaiBot 日程。首次请先由主人执行 /class 日程。",
-    "default": false
+    "hint": "默认开启。主人绑定学号（或配置 CAS 账号）后，插件每周在指定时间把本周课表写入日程；也可用 /class 日程 自动 on|off 切换。",
+    "default": true
   },
-  "schedule_sync_hours": {
-    "description": "自动同步间隔（小时）",
-    "type": "float",
-    "slider": { "min": 1, "max": 24, "step": 0.5 },
-    "default": 6
+  "schedule_weekday": {
+    "description": "每周导入日（0=周一…6=周日）",
+    "type": "int",
+    "hint": "默认周一。仅在每周自动导入开启时生效。",
+    "slider": { "min": 0, "max": 6, "step": 1 },
+    "default": 0
+  },
+  "schedule_time": {
+    "description": "每周导入时间（HH:MM）",
+    "type": "string",
+    "hint": "默认 06:10，按 timezone 计算。给 08:00 的课留出创建提醒的时间。",
+    "pattern": "^([01]?[0-9]|2[0-3]):[0-5][0-9]$",
+    "default": "06:10"
   },
   "class_reminder_minutes": {
     "description": "上课提醒提前量（分钟）",
