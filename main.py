@@ -103,7 +103,7 @@ except ImportError:  # 兼容直接以脚本路径加载 / 单文件测试
     )
 
 PLUGIN_ID = "srtb_plugin_csu_attendance"
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 DEFAULT_UPDATE_REPO = "https://github.com/emmm2315/srtb_plugin_csu_attendance"
 UPDATE_BRANCH = "main"
 UPDATE_MAX_ARCHIVE = 20 * 1024 * 1024
@@ -163,6 +163,7 @@ class CsuAttendance(Plugin):
         # 日程同步
         self._schedule_task: asyncio.Task | None = None
         self._schedule_wake = asyncio.Event()
+        self._schedule_lock = asyncio.Lock()
         self._schedule_keys: list[str] = []
         self._owner_key: str = ""
         # 自动更新
@@ -976,6 +977,7 @@ class CsuAttendance(Plugin):
         if uid and event.is_owner:
             self._owner_key = uid
             await self.put_kv_data(KV_OWNER_KEY, uid)
+        self._schedule_wake.set()
         # 新 token 立即体检，顺便清掉失效告警状态
         self._alerted_token = ""
         status = await self._run_health_check(notify=False)
@@ -1255,7 +1257,7 @@ class CsuAttendance(Plugin):
         day = str(course.get("date_full") or "").replace("-", "")[:8] or "00000000"
         return "csu:%s:%s:%02d:%s" % (student, day, int(course.get("class_start") or 0), digest)
 
-    async def _sync_schedule(self, student: str, remove: bool = False) -> dict:
+    async def _sync_schedule_impl(self, student: str, remove: bool = False) -> dict:
         """把一位学生的本周课表写入 ShiritaiBot 日程。
 
         - 课程：kind=course，只用于查询/展示，不触发提醒；
@@ -1274,6 +1276,15 @@ class CsuAttendance(Plugin):
 
         data = await self._fetch(student, force=True)
         info = normalize(data)
+        week_dates = {
+            str(item.get("Rq") or "")[:10]
+            for item in (data.get("Week") or [])
+            if isinstance(item, dict) and item.get("Rq")
+        }
+        if week_dates and self._today().isoformat() not in week_dates:
+            raise PublicError(
+                "WEDS 课表还没更新到本周（返回的是其它周），稍后再试"
+            )
         lead = max(0, self._as_int("class_reminder_minutes", 15))
         now = datetime.now(self._tz)
 
@@ -1380,6 +1391,11 @@ class CsuAttendance(Plugin):
             "week_now": info.get("week_now") or "",
             "week_num": info.get("week_num") or "",
         }
+
+    async def _sync_schedule(self, student: str, remove: bool = False) -> dict:
+        # 手动 /class 日程 与后台每周导入可能同时发生，串行化存储写入。
+        async with self._schedule_lock:
+            return await self._sync_schedule_impl(student, remove=remove)
 
     def _week_key(self, at: datetime | None = None) -> str:
         moment = at or datetime.now(self._tz)
@@ -2090,5 +2106,6 @@ class CsuAttendance(Plugin):
                 "csu_attendance；要刷新日程里的课程可调用 csu_sync_schedule，"
                 "已导入的课程也能用 routine_list 查看。</csu_attendance>"
             )
+
 
 

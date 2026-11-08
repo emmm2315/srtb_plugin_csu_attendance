@@ -5,11 +5,12 @@
 api = 1
 name = "srtb_plugin_csu_attendance"
 description = "中南大学课表 / 到课查询，可同步到 ShiritaiBot 日程"
-version = "1.2.0"
+version = "1.2.1"
 
 [settings_schema]
 type = "object"
 properties = {}
+
 
 
 
