@@ -25,6 +25,9 @@
     /class bind login <学号> <密码>  保存统一身份认证凭据
     /class login                    手动触发一次教务系统登录（诊断）
     /class jw                       取教务系统 accessToken.do 的 JWT（诊断）
+    /class update                   立即检查并更新插件
+    /class update check             只检查是否有新版本
+    /class update auto on|off       自动更新开关
 
 关于 token：WEDS 的 token 与学号无绑定关系，任意有效 token 可查询任意学号，
 因此建议由主人在插件配置里统一填一个 token，所有人群聊共用。
@@ -34,10 +37,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
+import json
 import re
+import shutil
+import stat
 import time
+import uuid
+import zipfile
 from datetime import date, datetime, time as dt_time, timedelta, timezone
+from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo
+
+import httpx
 
 from shiritaibot.api import (
     Context,
@@ -90,7 +102,12 @@ except ImportError:  # 兼容直接以脚本路径加载 / 单文件测试
     )
 
 PLUGIN_ID = "srtb_plugin_csu_attendance"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
+DEFAULT_UPDATE_REPO = "https://github.com/emmm2315/srtb_plugin_csu_attendance"
+UPDATE_BRANCH = "main"
+UPDATE_MAX_ARCHIVE = 20 * 1024 * 1024
+UPDATE_MAX_FILES = 2000
+UPDATE_MAX_UNPACKED = 50 * 1024 * 1024
 
 WEEKDAY_LABELS = {i: DAY_NAMES[i] for i in range(1, 8)}
 
@@ -100,6 +117,10 @@ KV_TOKEN = "weds_token"              # {"value": ..., "updated_at": ...}
 KV_OWNER_KEY = "owner_key"           # 最近一次使用本插件的主人的绑定键
 KV_SCHEDULE_KEYS = "schedule_keys"   # 本插件写入日程的 routine id 列表
 KV_LEGACY_BINDINGS = "bindings"      # 旧版按会话存的绑定，仅用于清理
+KV_UPDATE_STATE = "update_state"     # {"version":..., "applied_at":..., "backup":...}
+
+# 重载任务要跨过插件实例销毁，所以放在模块级集合里保活，不放进 terminate 的取消列表。
+_RELOAD_TASKS: set[asyncio.Task] = set()
 
 # 接口原始数据缓存时长（秒），避免频繁打学校接口
 RAW_CACHE_TTL = 30 * 60
@@ -141,6 +162,10 @@ class CsuAttendance(Plugin):
         self._schedule_task: asyncio.Task | None = None
         self._schedule_keys: list[str] = []
         self._owner_key: str = ""
+        # 自动更新
+        self._update_task: asyncio.Task | None = None
+        self._update_lock = asyncio.Lock()
+        self._code_dir_override: Path | None = None
         self._tz_name: str = str(self._cfg("timezone") or "Asia/Shanghai")
         try:
             self._tz = ZoneInfo(self._tz_name)
@@ -230,11 +255,12 @@ class CsuAttendance(Plugin):
         self._cas.password = self._config_password
 
         self.logger.log(
-            "[CSU] 插件已加载：%d 个绑定，WEDS token %s，日程同步 %s"
+            "[CSU] 插件已加载：%d 个绑定，WEDS token %s，日程同步 %s，自动更新 %s"
             % (
                 len(self._bindings),
                 "已配置" if self._current_token() else "未配置",
                 "开启" if self._as_bool("schedule_sync") else "关闭",
+                "开启" if self._as_bool("auto_update") else "关闭",
             )
         )
 
@@ -244,9 +270,11 @@ class CsuAttendance(Plugin):
             self._health_task = asyncio.create_task(self._health_loop())
         if self._as_bool("schedule_sync"):
             self._schedule_task = asyncio.create_task(self._schedule_loop())
+        if self._as_bool("auto_update"):
+            self._update_task = asyncio.create_task(self._update_loop())
 
     async def terminate(self):
-        for task in (self._health_task, self._schedule_task):
+        for task in (self._health_task, self._schedule_task, self._update_task):
             if task is not None:
                 task.cancel()
                 try:
@@ -255,6 +283,7 @@ class CsuAttendance(Plugin):
                     pass
         self._health_task = None
         self._schedule_task = None
+        self._update_task = None
         await self._cas.close()
         await self._weds.close()
 
@@ -634,6 +663,7 @@ class CsuAttendance(Plugin):
     ADMIN_ONLY_SUBS = {
         "token", "setup", "配置", "教程", "guide",
         "login", "jw", "raw", "refresh", "刷新", "强制", "日程", "schedule",
+        "update", "更新",
     }
 
     async def _guard(self, event: MessageEvent, source, label: str):
@@ -738,6 +768,11 @@ class CsuAttendance(Plugin):
 
         if sub in ("日程", "schedule"):
             async for r in self._cmd_schedule(event, rest):
+                yield r
+            return
+
+        if sub in ("update", "更新"):
+            async for r in self._cmd_update(event, rest):
                 yield r
             return
 
@@ -1044,6 +1079,11 @@ class CsuAttendance(Plugin):
             "已绑定会话数: %d" % len(self._bindings),
             "已导入日程项: %d" % len(self._schedule_keys),
             "日程自动同步: %s" % ("开启" if self._as_bool("schedule_sync") else "关闭"),
+            "自动更新: %s（每 %.0f 小时检查）"
+            % (
+                "开启" if self._as_bool("auto_update") else "关闭",
+                self._as_float("update_interval_hours", 24.0),
+            ),
         ]
         if token:
             lines.append("")
@@ -1129,6 +1169,9 @@ class CsuAttendance(Plugin):
                 "/class setup            抓包获取 token 的教程",
                 "/class 日程             把本周课表导入 ShiritaiBot 日程",
                 "/class 日程 关闭        移除本插件导入的日程",
+                "/class update           立即检查并更新插件",
+                "/class update check     只检查是否有新版本",
+                "/class update auto on   开启自动更新（off 关闭）",
                 "/class refresh [目标]   跳过缓存强制刷新",
                 "/class raw              附带接口原始 JSON",
                 "/class bind login <学号> <密码>",
@@ -1385,6 +1428,418 @@ class CsuAttendance(Plugin):
                 await asyncio.sleep(interval * 3600)
             except asyncio.CancelledError:
                 raise
+
+    # ── 自动更新 ──────────────────────────────────────────────────────────
+
+    def _code_dir(self) -> Path:
+        """当前插件代码目录（tests 里可覆盖，避免动到真实插件）。"""
+        if self._code_dir_override is not None:
+            return Path(self._code_dir_override)
+        return Path(__file__).resolve().parent
+
+    @staticmethod
+    def _version_tuple(value) -> tuple[int, ...]:
+        parts = re.findall(r"\d+", str(value or ""))
+        return tuple(int(part) for part in parts[:3]) or (0,)
+
+    @staticmethod
+    def _parse_update_repo(url: str) -> tuple[str, str]:
+        raw = (url or "").strip()
+        match = re.fullmatch(
+            r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?",
+            raw,
+        )
+        if not match or any(part in {".", ".."} for part in match.groups()):
+            raise PublicError(
+                "更新源必须是公开的 https://github.com/作者/仓库 地址"
+            )
+        return match.group(1), match.group(2)
+
+    def _proxy_value(self) -> str | None:
+        return str(self._cfg("http_proxy") or "").strip() or None
+
+    async def _fetch_remote_version(self) -> dict:
+        owner, repo = self._parse_update_repo(
+            str(self._cfg("update_repo") or DEFAULT_UPDATE_REPO)
+        )
+        url = (
+            "https://raw.githubusercontent.com/%s/%s/%s/metadata.yaml?t=%d"
+            % (owner, repo, UPDATE_BRANCH, int(time.time()))
+        )
+        headers = {
+            "User-Agent": "%s/%s" % (PLUGIN_ID, VERSION),
+            "Cache-Control": "no-cache",
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30),
+                proxy=self._proxy_value(),
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                text = response.text
+        except httpx.HTTPError as exc:
+            raise PublicError("检查更新失败：%s" % type(exc).__name__) from None
+
+        match = re.search(r"(?m)^version:\s*['\"]?([0-9][0-9A-Za-z.+-]*)", text or "")
+        if not match:
+            raise PublicError("更新源的 metadata.yaml 中没有 version")
+        remote_version = match.group(1).strip()
+        return {
+            "owner": owner,
+            "repo": repo,
+            "version": remote_version,
+            "url": "https://github.com/%s/%s" % (owner, repo),
+        }
+
+    async def _download_update_archive(self, owner: str, repo: str) -> bytes:
+        url = "https://github.com/%s/%s/archive/refs/heads/%s.zip" % (
+            owner,
+            repo,
+            UPDATE_BRANCH,
+        )
+        headers = {
+            "User-Agent": "%s/%s" % (PLUGIN_ID, VERSION),
+            "Cache-Control": "no-cache",
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60),
+                proxy=self._proxy_value(),
+                follow_redirects=True,
+            ) as client:
+                async with client.stream("GET", url, headers=headers) as response:
+                    response.raise_for_status()
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > UPDATE_MAX_ARCHIVE:
+                            raise PublicError("更新包超过 20 MiB，已拒绝")
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+        except httpx.HTTPError as exc:
+            raise PublicError("下载更新失败：%s" % type(exc).__name__) from None
+
+        if not data:
+            raise PublicError("更新包为空")
+        return data
+
+    async def _check_update(self) -> dict:
+        remote = await self._fetch_remote_version()
+        remote["current"] = VERSION
+        remote["newer"] = self._version_tuple(remote["version"]) > self._version_tuple(
+            VERSION
+        )
+        return remote
+
+    def _install_archive_sync(self, data: bytes, expected_version: str) -> dict:
+        """校验并安装更新包。只替换代码文件，不碰配置、Vault 和 plugin_data。"""
+        code_dir = self._code_dir()
+        if not code_dir.is_dir():
+            raise PublicError("找不到当前插件代码目录")
+        if (code_dir / ".git").exists():
+            raise PublicError("当前插件目录是 git 工作区，请用 git pull 更新，避免自动更新弄脏工作区")
+
+        data_dir = Path(self.data_dir)
+        staging = data_dir / (".update-" + uuid.uuid4().hex[:10])
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True)
+
+        backup: Path | None = None
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                infos = archive.infolist()
+                if len(infos) > UPDATE_MAX_FILES:
+                    raise PublicError("更新包文件数量过多")
+                if sum(info.file_size for info in infos) > UPDATE_MAX_UNPACKED:
+                    raise PublicError("更新包解压后过大")
+
+                for info in infos:
+                    name = info.filename
+                    path = PurePosixPath(name)
+                    mode = info.external_attr >> 16
+                    if (
+                        path.is_absolute()
+                        or ".." in path.parts
+                        or "\\" in name
+                        or ":" in name
+                        or stat.S_ISLNK(mode)
+                    ):
+                        raise PublicError("更新包包含不安全的路径")
+
+                candidates = [
+                    info
+                    for info in infos
+                    if PurePosixPath(info.filename).name == "metadata.yaml"
+                ]
+                if len(candidates) != 1:
+                    raise PublicError("更新包中应包含一个 metadata.yaml")
+                root = PurePosixPath(candidates[0].filename).parent
+
+                names = {PurePosixPath(info.filename).as_posix() for info in infos}
+                for required in ("main.py", "metadata.yaml", "_conf_schema.json"):
+                    if (root / required).as_posix() not in names:
+                        raise PublicError("更新包缺少 " + required)
+
+                for info in infos:
+                    path = PurePosixPath(info.filename)
+                    if root not in path.parents and path != root:
+                        continue
+                    rel = path.relative_to(root)
+                    if not rel.parts or any(
+                        part in {".git", "__pycache__"} for part in rel.parts
+                    ):
+                        continue
+                    target = staging.joinpath(*rel.parts)
+                    if info.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(info) as source, target.open("wb") as output:
+                        shutil.copyfileobj(source, output)
+
+            metadata_text = (staging / "metadata.yaml").read_text(encoding="utf-8")
+            match = re.search(
+                r"(?m)^version:\s*['\"]?([0-9][0-9A-Za-z.+-]*)", metadata_text
+            )
+            if not match:
+                raise PublicError("更新包的 metadata.yaml 中没有 version")
+            archive_version = match.group(1).strip()
+            if self._version_tuple(archive_version) != self._version_tuple(
+                expected_version
+            ):
+                raise PublicError("更新包版本与远端版本不一致")
+            if self._version_tuple(archive_version) <= self._version_tuple(VERSION):
+                raise PublicError("更新包版本不高于当前版本")
+
+            source_text = (staging / "main.py").read_text(encoding="utf-8")
+            compile(source_text, "main.py", "exec")
+            version_match = re.search(
+                r"(?m)^VERSION\s*=\s*['\"]([^'\"]+)", source_text
+            )
+            if not version_match or self._version_tuple(
+                version_match.group(1)
+            ) != self._version_tuple(archive_version):
+                raise PublicError("更新包 main.py 的 VERSION 与 metadata.yaml 不一致")
+            json.loads((staging / "_conf_schema.json").read_text(encoding="utf-8"))
+
+            backup_root = data_dir / "update_backups"
+            backup_root.mkdir(parents=True, exist_ok=True)
+            backup = backup_root / (
+                "%s-%s-%s"
+                % (VERSION, time.strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:4])
+            )
+            shutil.copytree(
+                code_dir,
+                backup,
+                ignore=shutil.ignore_patterns("__pycache__", ".git", "*.pyc"),
+            )
+
+            try:
+                for source_path in staging.rglob("*"):
+                    if not source_path.is_file():
+                        continue
+                    rel = source_path.relative_to(staging)
+                    destination = code_dir / rel
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source_path, destination)
+            except Exception:
+                # 复制到一半失败时恢复到旧代码，避免留下半新半旧的文件。
+                self._restore_backup(backup)
+                raise
+
+            return {"version": archive_version, "backup": str(backup)}
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def _restore_backup(self, backup: Path) -> None:
+        code_dir = self._code_dir()
+        backup = Path(backup)
+        if not backup.is_dir():
+            raise PublicError("更新备份不存在")
+        for source_path in backup.rglob("*"):
+            if not source_path.is_file():
+                continue
+            rel = source_path.relative_to(backup)
+            destination = code_dir / rel
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source_path, destination)
+
+    def _schedule_reload(self, backup: Path, version: str) -> None:
+        task = asyncio.create_task(self._reload_after_update(backup, version))
+        _RELOAD_TASKS.add(task)
+        task.add_done_callback(_RELOAD_TASKS.discard)
+
+    async def _reload_after_update(self, backup: Path, version: str) -> None:
+        # 命令处理期间宿主持有插件锁；等回复发出、锁释放后再 reload。
+        await asyncio.sleep(2)
+        host = getattr(self.context, "host", None)
+        if host is None:
+            await self._safe_notify(
+                "已安装插件更新 %s，但当前宿主不支持自动重载，请手动重载插件。" % version
+            )
+            return
+        try:
+            await host.reload(self.name)
+            self.logger.log("[CSU] 已自动重载到 %s" % version)
+        except Exception as exc:
+            self.logger.error("[CSU] 更新后自动重载失败", exc=exc)
+            try:
+                await asyncio.to_thread(self._restore_backup, backup)
+                await host.reload(self.name)
+                await self._safe_notify(
+                    "自动更新到 %s 失败，已回滚到 %s。请查看运行日志。"
+                    % (version, VERSION)
+                )
+            except Exception as rollback_exc:
+                self.logger.error("[CSU] 更新回滚失败", exc=rollback_exc)
+                await self._safe_notify(
+                    "自动更新到 %s 失败，且回滚失败；请手动检查插件目录。" % version
+                )
+
+    async def _safe_notify(self, text: str) -> None:
+        try:
+            await self.context.notify_owner(text)
+        except Exception:
+            self.logger.warning("[CSU] 更新通知发送失败")
+
+    async def _check_and_update(self, apply: bool) -> dict:
+        async with self._update_lock:
+            remote = await self._check_update()
+            result = {
+                "status": "current",
+                "current": VERSION,
+                "version": remote["version"],
+                "url": remote["url"],
+            }
+            if not remote["newer"]:
+                return result
+            if not apply:
+                result.update(status="available")
+                return result
+
+            data = await self._download_update_archive(remote["owner"], remote["repo"])
+            try:
+                installed = await asyncio.to_thread(
+                    self._install_archive_sync, data, remote["version"]
+                )
+            except PublicError:
+                raise
+            except Exception as exc:
+                raise PublicError("应用更新失败：%s" % type(exc).__name__) from None
+
+            await self.put_kv_data(
+                KV_UPDATE_STATE,
+                {
+                    "version": installed["version"],
+                    "applied_at": datetime.now(self._tz).isoformat(),
+                    "backup": installed["backup"],
+                },
+            )
+            self._schedule_reload(Path(installed["backup"]), installed["version"])
+            result.update(
+                status="updated",
+                version=installed["version"],
+                backup=installed["backup"],
+            )
+            return result
+
+    async def _update_loop(self) -> None:
+        interval = max(1.0, self._as_float("update_interval_hours", 24.0))
+        await asyncio.sleep(45)
+        while True:
+            try:
+                if self._as_bool("auto_update"):
+                    result = await self._check_and_update(apply=True)
+                    if result["status"] == "updated":
+                        await self._safe_notify(
+                            "🔄 中南大学到课插件已自动更新到 %s，正在重载。\n%s"
+                            % (result["version"], result["url"])
+                        )
+                    else:
+                        self.logger.debug("[CSU] 自动更新检查：已是最新 %s" % VERSION)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.warning("[CSU] 自动更新检查失败：%s" % exc)
+            try:
+                await asyncio.sleep(interval * 3600)
+            except asyncio.CancelledError:
+                raise
+
+    async def _stop_update_task(self) -> None:
+        task, self._update_task = self._update_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _cmd_update(self, event: MessageEvent, arg: str):
+        rest = (arg or "").strip()
+        lower = rest.lower()
+
+        if lower in {"auto", "自动"} or lower.startswith(("auto ", "自动 ")):
+            parts = lower.split()
+            if len(parts) == 1:
+                yield event.plain_result(
+                    "自动更新：%s\n检查间隔：每 %.0f 小时\n更新源：%s"
+                    % (
+                        "开启" if self._as_bool("auto_update") else "关闭",
+                        self._as_float("update_interval_hours", 24.0),
+                        self._cfg("update_repo") or DEFAULT_UPDATE_REPO,
+                    )
+                )
+                return
+            enable = parts[1] in {"on", "开", "启用", "true", "1"}
+            self.config["auto_update"] = enable
+            saver = getattr(self.config, "save_config", None)
+            if callable(saver):
+                try:
+                    await saver()
+                except Exception:
+                    self.logger.warning("[CSU] 自动更新配置保存失败")
+            if enable:
+                if self._update_task is None or self._update_task.done():
+                    self._update_task = asyncio.create_task(self._update_loop())
+                yield event.plain_result(
+                    "✅ 自动更新已开启，每 %.0f 小时检查一次。\n发送 /class update 可立即检查。"
+                    % self._as_float("update_interval_hours", 24.0)
+                )
+            else:
+                await self._stop_update_task()
+                yield event.plain_result("✅ 自动更新已关闭。")
+            return
+
+        check_only = lower in {"check", "检查", "检查更新"}
+        try:
+            result = await self._check_and_update(apply=not check_only)
+        except PublicError as exc:
+            yield event.plain_result("❌ %s" % exc)
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("[CSU] 更新检查异常", exc=exc)
+            yield event.plain_result("❌ 更新检查异常：%s" % type(exc).__name__)
+            return
+
+        if result["status"] == "current":
+            yield event.plain_result(
+                "✅ 已是最新版本 %s\n更新源：%s" % (result["current"], result["url"])
+            )
+        elif result["status"] == "available":
+            yield event.plain_result(
+                "🔔 发现新版本 %s（当前 %s）\n发送 /class update 立即更新。"
+                % (result["version"], result["current"])
+            )
+        else:
+            yield event.plain_result(
+                "✅ 已更新到 %s，插件将在约 2 秒后自动重载。\n已备份旧版本到插件数据目录。"
+                % result["version"]
+            )
 
     # ── LLM 工具 ──────────────────────────────────────────────────────────
 

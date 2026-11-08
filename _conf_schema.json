@@ -96,5 +96,23 @@
     "hint": "导入日程时同时创建上课提醒。设为 0 表示只导入课程，不建提醒。",
     "slider": { "min": 0, "max": 120, "step": 5 },
     "default": 15
+  },
+  "auto_update": {
+    "description": "自动从 GitHub 更新插件",
+    "type": "bool",
+    "hint": "默认关闭。开启后定期检查 metadata.yaml 的 version，发现更高版本会下载、校验、备份并自动重载。只建议信任更新源时开启。",
+    "default": false
+  },
+  "update_repo": {
+    "description": "更新源 GitHub 仓库",
+    "type": "string",
+    "hint": "必须是公开的 https://github.com/作者/仓库。默认使用本插件的发布仓库。",
+    "default": "https://github.com/emmm2315/srtb_plugin_csu_attendance"
+  },
+  "update_interval_hours": {
+    "description": "自动更新检查间隔（小时）",
+    "type": "float",
+    "slider": { "min": 1, "max": 168, "step": 1 },
+    "default": 24
   }
 }

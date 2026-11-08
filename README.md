@@ -2,7 +2,8 @@
 
 中南大学**课表 / 到课 / 打卡查询**插件，从 AstrBot 版 `astrbot_plugin_csu_attendance` 迁移到
 ShiritaiBot（API v2）。除了原有的课表查询、学号绑定、WEDS token 体检外，新增了
-**把本周课表导入 ShiritaiBot 日程**、**上课前提醒**和给模型使用的查询工具。
+**把本周课表导入 ShiritaiBot 日程**、**上课前提醒**、给模型使用的查询工具，以及
+**可选的 GitHub 自动更新**。
 
 ---
 
@@ -15,6 +16,7 @@ ShiritaiBot（API v2）。除了原有的课表查询、学号绑定、WEDS toke
 | WEDS token | 配置一次全群共用；支持聊天命令更新、立即校验、定时体检、失效告警 |
 | 统一身份认证（CAS） | 可选，用于诊断和教务会话；WEDS 查询不依赖它 |
 | 日程同步 | 把主人本周课表写成 `course`，把上课提醒写成 `reminder`，交给 ShiritaiBot 日程系统触发 |
+| 自动更新 | 可选，从 GitHub 检查 `metadata.yaml` 版本；校验、备份后自动重载 |
 | LLM 工具 | `csu_attendance` 查询课表；`csu_sync_schedule` 刷新日程（仅主人私聊） |
 
 > ShiritaiBot 的插件指令目前只支持**文本回复**，所以原 AstrBot 版的 HTML / 图片课表没有迁移；
@@ -57,6 +59,9 @@ ShiritaiBot 自带的 `httpx`、`cryptography`，**不需要额外安装**。
 | `schedule_sync` | 否 | 自动把主人课表同步到日程，默认关 |
 | `schedule_sync_hours` | 否 | 自动同步间隔，默认 6 小时 |
 | `class_reminder_minutes` | 否 | 上课提醒提前量，默认 15 分钟；0 表示只导入课程、不建提醒 |
+| `auto_update` | 否 | 自动从 GitHub 更新插件，默认关 |
+| `update_repo` | 否 | 更新源，默认本插件仓库 `https://github.com/emmm2315/srtb_plugin_csu_attendance` |
+| `update_interval_hours` | 否 | 自动检查间隔，默认 24 小时 |
 
 ### 获取 WEDS token（约 1 分钟，只做一次）
 
@@ -97,6 +102,9 @@ ShiritaiBot 自带的 `httpx`、`cryptography`，**不需要额外安装**。
 | `/class setup` | 抓包 + 配置 token 的分步教程 |
 | `/class 日程` | 把本周课表导入 ShiritaiBot 日程，并创建上课提醒 |
 | `/class 日程 关闭` | 移除本插件导入的日程 |
+| `/class update` | 立即检查并更新插件 |
+| `/class update check` | 只检查是否有新版本 |
+| `/class update auto on\|off` | 开启 / 关闭自动更新 |
 | `/class refresh [目标]` | 跳过缓存强制刷新 |
 | `/class raw` | 查询并附带原始 JSON |
 | `/class bind login <学号> <密码>` | 保存统一身份认证凭据（加密） |
@@ -134,7 +142,53 @@ ShiritaiBot 的「日程」有五种类型：`todo` / `event` / `course` / `remi
 ShiritaiBot 0.2.x 可用的集成方式；如果宿主以后提供正式的日程 API，只需替换
 `_sync_schedule()` 里的读写部分。
 
-## 六、权限与隐私
+## 六、自动更新
+
+插件可以从 GitHub 检查并更新自己，默认**关闭**。开启方式：
+
+```text
+/class update auto on
+```
+
+或在插件配置里把 `auto_update` 设为开。开启后按 `update_interval_hours`（默认 24 小时）
+检查一次；也可以随时手动执行：
+
+```text
+/class update check     # 只检查
+/class update           # 立即检查并更新
+/class update auto off  # 关闭自动更新
+```
+
+### 工作方式
+
+1. 读取 `update_repo` 指向仓库默认分支的 `metadata.yaml`，比较 `version`；
+2. 只有远端版本**高于**当前版本才继续；
+3. 下载该分支的 ZIP；
+4. 校验：路径穿越 / 符号链接、文件数与大小、`metadata.yaml` 版本、`main.py` 可编译、
+   `main.py` 的 `VERSION` 与 `metadata.yaml` 一致、`_conf_schema.json` 是合法 JSON；
+5. 把当前代码备份到 `plugin_data/srtb_plugin_csu_attendance/update_backups/`；
+6. 只替换代码文件，不碰插件配置、Vault 和 `plugin_data` 里的数据；
+7. 约 2 秒后调用宿主的 `PluginManager.reload()` 自动重载；
+8. 如果重载失败，自动恢复备份并再次重载旧代码，同时私聊主人告警。
+
+### 发布新版本时
+
+自动更新依赖版本号，必须同时修改：
+
+- `metadata.yaml` 的 `version`
+- `main.py` 的 `VERSION`
+- `plugin.toml` 的 `version`（兼容清单）
+
+然后推送到仓库默认分支 `main`。只改代码不升版本，自动更新不会触发。
+
+### 安全说明
+
+- 只接受 `https://github.com/作者/仓库` 形式的公开仓库；
+- 自动更新执行的是从网络下载的代码，**只应把 `update_repo` 指向你信任的仓库**；
+- 默认关闭；开启后任何能修改该仓库的人都能向 Bot 推送代码，请保护仓库权限；
+- 更新失败会尽量回滚，但强烈建议在升级前保留 `plugin_data` 备份。
+
+## 七、权限与隐私
 
 - **token、CAS 密码**使用 `_conf_schema.json` 的 `secret` 字段，保存进 ShiritaiBot 的 Vault，
   不会回显、不会写入日志、不会返回给模型。
@@ -144,7 +198,7 @@ ShiritaiBot 0.2.x 可用的集成方式；如果宿主以后提供正式的日�
   调用者自己的绑定；`csu_sync_schedule` 是 `normal` 工具，仅主人私聊可用。
 - 课表内容会发往学校 WEDS 接口；图片渲染已移除，不再有第三方 t2i 外发。
 
-## 七、和 AstrBot 版的差异
+## 八、和 AstrBot 版的差异
 
 | 项目 | AstrBot 版 | ShiritaiBot 版 |
 | --- | --- | --- |
@@ -162,19 +216,23 @@ ShiritaiBot 0.2.x 可用的集成方式；如果宿主以后提供正式的日�
 > AstrBot 和 ShiritaiBot 的数据目录、KV 与配置是分开的，迁移后需要重新 `/bind` 学号、
 > 重新填一次 `weds_token`；旧 AstrBot 数据不会自动带过来。
 
-## 八、开发与测试
+## 九、开发与测试
 
 ```bash
 # 离线测试（不联网，用假宿主）
 python tests/run_tests.py
 ```
 
-测试覆盖：文本渲染、学号绑定、权限门控、日程写入 / 去重 / 清理、LLM 工具、清单结构。
+测试覆盖：文本渲染、学号绑定、权限门控、日程写入 / 去重 / 清理、LLM 工具、自动更新安装 /
+校验 / 备份、清单结构。
 真实接口联调需要有效的 WEDS token，测试时不要把 token 写进仓库。
 
-## 九、已知限制
+## 十、已知限制
 
 - WEDS token 仍需人工抓包：token 由微信小程序下发，无法仅凭学号密码换取。
 - 教务系统 `accessToken.do` 的 JWT 不被 WEDS 接受，`/class jw` 只作诊断。
 - 课表接口按周返回；自动同步间隔决定跨周切换的及时性。
 - 日程写入依赖宿主当前的 `routine` 存储结构；ShiritaiBot 升级后如改动该结构，需要同步调整。
+- 自动更新只支持公开 GitHub 仓库，且必须通过提升版本号触发；更新后依赖宿主的
+  `PluginManager.reload()`，如果宿主改为异步重载机制，需要相应调整。
+

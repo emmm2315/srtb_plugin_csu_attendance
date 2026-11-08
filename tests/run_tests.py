@@ -7,9 +7,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import shutil
 import sys
 import types
+import uuid
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -435,7 +439,7 @@ async def test_renderer():
 async def test_plugin():
     print("\n[2] 插件指令 / 绑定")
     hook = sys.modules["shiritaibot.api"].hook
-    from main import CsuAttendance
+    from main import CsuAttendance, VERSION
 
     ctx = FakeContext()
     settings = FakeSettings(
@@ -513,14 +517,14 @@ async def test_plugin():
     denied = await collect(plugin.class_cmd(FakeEvent(sender_id="123"), "token abc"))
     check("非主人不能改 token", "主人专属" in denied[0], denied)
     status = await collect(plugin.class_cmd(owner, "status"))
-    check("主人状态含版本", "1.0.1" in status[0], status[0])
+    check("主人状态含版本", VERSION in status[0], status[0])
 
     await plugin.terminate()
 
 
 async def test_schedule():
     print("\n[3] 日程同步")
-    from main import CsuAttendance
+    from main import CsuAttendance, VERSION
 
     ctx = FakeContext()
     settings = FakeSettings(
@@ -581,7 +585,7 @@ async def test_schedule():
 
 async def test_tools():
     print("\n[4] LLM 工具")
-    from main import CsuAttendance
+    from main import CsuAttendance, VERSION
 
     ctx = FakeContext()
     settings = FakeSettings(
@@ -629,8 +633,111 @@ async def test_tools():
     await plugin.terminate()
 
 
+async def test_update():
+    print("\n[5] 自动更新")
+    from main import CsuAttendance, VERSION
+    from shiritaibot.api import PublicError
+
+    check("版本号解析", CsuAttendance._version_tuple("v1.2.3") == (1, 2, 3))
+    check(
+        "GitHub 仓库解析",
+        CsuAttendance._parse_update_repo(
+            "https://github.com/emmm2315/srtb_plugin_csu_attendance"
+        )
+        == ("emmm2315", "srtb_plugin_csu_attendance"),
+    )
+    try:
+        CsuAttendance._parse_update_repo("https://example.com/a/b")
+        check("拒绝非 GitHub 更新源", False)
+    except PublicError:
+        check("拒绝非 GitHub 更新源", True)
+
+    ctx = FakeContext()
+    settings = FakeSettings(
+        token_check_enable=False,
+        weds_token="TEST_TOKEN",
+        weds_base="https://example.invalid",
+        orga_id="10001",
+        timezone="Asia/Shanghai",
+        schedule_sync=False,
+        auto_update=False,
+        update_repo="https://github.com/emmm2315/srtb_plugin_csu_attendance",
+        update_interval_hours=24,
+        class_reminder_minutes=15,
+    )
+    plugin = CsuAttendance(ctx, settings)
+    await plugin.initialize()
+
+    root = Path(r"D:\astrbot\_test_update_%s" % uuid.uuid4().hex[:8])
+    code_dir = root / "code"
+    data_dir = root / "data"
+    code_dir.mkdir(parents=True)
+    data_dir.mkdir()
+    (code_dir / "main.py").write_text('VERSION = "1.1.0"\n', encoding="utf-8")
+    (code_dir / "metadata.yaml").write_text(
+        "name: srtb_plugin_csu_attendance\nversion: 1.1.0\n", encoding="utf-8"
+    )
+    (code_dir / "_conf_schema.json").write_text("{}", encoding="utf-8")
+    plugin._code_dir_override = code_dir
+    ctx.data_dir = data_dir
+
+    def make_zip(version: str = "9.9.9", unsafe: bool = False) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                "repo-main/metadata.yaml",
+                "name: srtb_plugin_csu_attendance\nversion: %s\n" % version,
+            )
+            archive.writestr("repo-main/main.py", 'VERSION = "%s"\n' % version)
+            archive.writestr("repo-main/_conf_schema.json", "{}")
+            if unsafe:
+                archive.writestr("repo-main/../evil.py", "print('evil')")
+        return buffer.getvalue()
+
+    try:
+        result = plugin._install_archive_sync(make_zip(), "9.9.9")
+        check("更新包安装成功", result["version"] == "9.9.9", str(result))
+        check(
+            "代码文件已替换",
+            'VERSION = "9.9.9"' in (code_dir / "main.py").read_text(encoding="utf-8"),
+        )
+        backup = Path(result["backup"])
+        check("更新前已备份", backup.is_dir(), str(backup))
+        check(
+            "备份保留旧版本",
+            'VERSION = "1.1.0"' in (backup / "main.py").read_text(encoding="utf-8"),
+        )
+
+        try:
+            plugin._install_archive_sync(make_zip(unsafe=True), "9.9.9")
+            check("拒绝路径穿越", False)
+        except PublicError as exc:
+            check("拒绝路径穿越", "不安全" in str(exc), str(exc))
+
+        try:
+            plugin._install_archive_sync(make_zip(), "8.8.8")
+            check("拒绝版本不一致", False)
+        except PublicError as exc:
+            check("拒绝版本不一致", "不一致" in str(exc), str(exc))
+
+        check("更新包仍可重复安装", plugin._install_archive_sync(make_zip(), "9.9.9")["version"] == "9.9.9")
+
+        owner = FakeEvent(sender_id="999", owner=True)
+        state = await collect(plugin._cmd_update(owner, "auto"))
+        check("自动更新状态可查询", "关闭" in state[0], state[0])
+        enabled = await collect(plugin._cmd_update(owner, "auto on"))
+        check("自动更新可开启", "已开启" in enabled[0], enabled[0])
+        check("自动更新任务已启动", plugin._update_task is not None)
+        disabled = await collect(plugin._cmd_update(owner, "auto off"))
+        check("自动更新可关闭", "已关闭" in disabled[0], disabled[0])
+        check("自动更新任务已停止", plugin._update_task is None)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        await plugin.terminate()
+
+
 def test_manifest():
-    print("\n[5] 清单 / 配置")
+    print("\n[6] 清单 / 配置")
     import re
 
     meta_text = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
@@ -648,6 +755,8 @@ def test_manifest():
     check("版本范围满足 0.2.x", meta.get("shiritaibot_version") == ">=0.2,<1")
     check("weds_token 是 secret", schema["weds_token"].get("secret") is True)
     check("cas_password 是 secret", schema["cas_password"].get("secret") is True)
+    check("自动更新默认关闭", schema["auto_update"].get("default") is False)
+    check("更新源是 GitHub", "github.com" in schema["update_repo"].get("default", ""))
     allowed = {"string", "text", "int", "float", "bool", "object", "list", "dict", "template_list"}
     check("所有配置类型合法", all(spec.get("type") in allowed for spec in schema.values()))
     check("配置都有 description", all(spec.get("description") for spec in schema.values()))
@@ -665,6 +774,7 @@ async def main():
     await test_plugin()
     await test_schedule()
     await test_tools()
+    await test_update()
     test_manifest()
     print("\n结果：%d 通过，%d 失败" % (PASS, FAIL))
     return 0 if FAIL == 0 else 1
@@ -672,4 +782,5 @@ async def main():
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
+
 
